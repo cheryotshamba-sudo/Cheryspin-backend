@@ -47,10 +47,16 @@ async function initializeDatabase() {
 
     try {
 
+        /*
+         * Create the users table if it does not exist.
+         */
+
         await pool.query(`
             CREATE TABLE IF NOT EXISTS cheryspin_users (
                 id SERIAL PRIMARY KEY,
                 full_name VARCHAR(120) NOT NULL,
+                age INTEGER NOT NULL,
+                email VARCHAR(180) UNIQUE NOT NULL,
                 phone VARCHAR(30) UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 balance NUMERIC(12, 2) DEFAULT 1500.00,
@@ -59,6 +65,47 @@ async function initializeDatabase() {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
+
+
+        /*
+         * Add new columns to an older database if necessary.
+         */
+
+        await pool.query(`
+            ALTER TABLE cheryspin_users
+            ADD COLUMN IF NOT EXISTS age INTEGER
+        `);
+
+        await pool.query(`
+            ALTER TABLE cheryspin_users
+            ADD COLUMN IF NOT EXISTS email VARCHAR(180)
+        `);
+
+
+        /*
+         * Older database versions may have allowed
+         * password_hash to be NULL.
+         *
+         * New accounts require a password.
+         */
+
+        await pool.query(`
+            ALTER TABLE cheryspin_users
+            ALTER COLUMN password_hash DROP NOT NULL
+        `);
+
+
+        /*
+         * Unique email index for existing databases.
+         */
+
+        await pool.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            cheryspin_users_email_unique
+            ON cheryspin_users (email)
+            WHERE email IS NOT NULL
+        `);
+
 
         console.log("CherySpin database ready.");
 
@@ -105,6 +152,11 @@ app.get("/api/health", async (req, res) => {
 
     } catch (error) {
 
+        console.error(
+            "Health check error:",
+            error
+        );
+
         res.status(500).json({
             success: false,
             message: "Database connection failed."
@@ -125,39 +177,184 @@ app.post("/api/register", async (req, res) => {
 
         const {
             full_name,
+            age,
+            email,
             phone,
-            password
+            password,
+            confirm_password
         } = req.body;
 
 
-        if (!full_name || !phone || !password) {
+        /* =========================
+           REQUIRED FIELDS
+        ========================= */
+
+        if (
+            !full_name ||
+            !age ||
+            !email ||
+            !phone ||
+            !password ||
+            !confirm_password
+        ) {
 
             return res.status(400).json({
+
                 success: false,
-                message: "Full name, phone number and password are required."
+
+                message:
+                    "Full name, age, email, phone number, password and confirm password are required."
+
             });
 
         }
 
 
-        if (password.length < 6) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Password must be at least 6 characters."
-            });
-
-        }
-
+        /* =========================
+           CLEAN DATA
+        ========================= */
 
         const cleanName =
             String(full_name).trim();
 
+        const cleanAge =
+            Number(age);
+
+        const cleanEmail =
+            String(email).trim().toLowerCase();
+
         const cleanPhone =
             String(phone).trim();
 
+        const cleanPassword =
+            String(password);
 
-        const existingUser =
+        const cleanConfirmPassword =
+            String(confirm_password);
+
+
+        /* =========================
+           VALIDATE NAME
+        ========================= */
+
+        if (cleanName.length < 2) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Please enter your full name."
+
+            });
+
+        }
+
+
+        /* =========================
+           VALIDATE AGE
+        ========================= */
+
+        if (
+            !Number.isInteger(cleanAge) ||
+            cleanAge < 18 ||
+            cleanAge > 99
+        ) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Age must be between 18 and 99."
+
+            });
+
+        }
+
+
+        /* =========================
+           VALIDATE EMAIL
+        ========================= */
+
+        const emailPattern =
+            /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+        if (!emailPattern.test(cleanEmail)) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Please enter a valid email address."
+
+            });
+
+        }
+
+
+        /* =========================
+           VALIDATE PHONE
+        ========================= */
+
+        if (!/^07\d{8}$/.test(cleanPhone)) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Enter a valid Kenyan phone number starting with 07."
+
+            });
+
+        }
+
+
+        /* =========================
+           VALIDATE PASSWORD
+        ========================= */
+
+        if (cleanPassword.length < 6) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Password must be at least 6 characters."
+
+            });
+
+        }
+
+
+        /* =========================
+           CONFIRM PASSWORD
+        ========================= */
+
+        if (
+            cleanPassword !== cleanConfirmPassword
+        ) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Passwords do not match."
+
+            });
+
+        }
+
+
+        /* =========================
+           CHECK PHONE
+        ========================= */
+
+        const existingPhone =
             await pool.query(
                 `
                 SELECT id
@@ -168,19 +365,63 @@ app.post("/api/register", async (req, res) => {
             );
 
 
-        if (existingUser.rows.length > 0) {
+        if (existingPhone.rows.length > 0) {
 
             return res.status(409).json({
+
                 success: false,
-                message: "An account with this phone number already exists."
+
+                message:
+                    "An account with this phone number already exists."
+
             });
 
         }
 
 
-        const passwordHash =
-            await bcrypt.hash(password, 10);
+        /* =========================
+           CHECK EMAIL
+        ========================= */
 
+        const existingEmail =
+            await pool.query(
+                `
+                SELECT id
+                FROM cheryspin_users
+                WHERE LOWER(email) = LOWER($1)
+                `,
+                [cleanEmail]
+            );
+
+
+        if (existingEmail.rows.length > 0) {
+
+            return res.status(409).json({
+
+                success: false,
+
+                message:
+                    "An account with this email already exists."
+
+            });
+
+        }
+
+
+        /* =========================
+           HASH PASSWORD
+        ========================= */
+
+        const passwordHash =
+            await bcrypt.hash(
+                cleanPassword,
+                10
+            );
+
+
+        /* =========================
+           CREATE ACCOUNT
+        ========================= */
 
         const result =
             await pool.query(
@@ -188,6 +429,8 @@ app.post("/api/register", async (req, res) => {
                 INSERT INTO cheryspin_users
                 (
                     full_name,
+                    age,
+                    email,
                     phone,
                     password_hash,
                     balance,
@@ -199,6 +442,8 @@ app.post("/api/register", async (req, res) => {
                     $1,
                     $2,
                     $3,
+                    $4,
+                    $5,
                     1500.00,
                     5,
                     FALSE
@@ -206,6 +451,8 @@ app.post("/api/register", async (req, res) => {
                 RETURNING
                     id,
                     full_name,
+                    age,
+                    email,
                     phone,
                     balance,
                     free_spins,
@@ -214,6 +461,8 @@ app.post("/api/register", async (req, res) => {
                 `,
                 [
                     cleanName,
+                    cleanAge,
+                    cleanEmail,
                     cleanPhone,
                     passwordHash
                 ]
@@ -223,6 +472,10 @@ app.post("/api/register", async (req, res) => {
         const user =
             result.rows[0];
 
+
+        /* =========================
+           RESPONSE
+        ========================= */
 
         res.status(201).json({
 
@@ -265,37 +518,61 @@ app.post("/api/login", async (req, res) => {
     try {
 
         const {
-            phone,
+            identifier,
             password
         } = req.body;
 
 
-        if (!phone || !password) {
+        /* =========================
+           REQUIRED FIELDS
+        ========================= */
+
+        if (!identifier || !password) {
 
             return res.status(400).json({
 
                 success: false,
 
                 message:
-                    "Phone number and password are required."
+                    "Email or phone number and password are required."
 
             });
 
         }
 
 
-        const cleanPhone =
-            String(phone).trim();
+        const cleanIdentifier =
+            String(identifier).trim();
 
+        const cleanPassword =
+            String(password);
+
+
+        /* =========================
+           FIND USER
+        ========================= */
 
         const result =
             await pool.query(
                 `
-                SELECT *
+                SELECT
+                    id,
+                    full_name,
+                    age,
+                    email,
+                    phone,
+                    password_hash,
+                    balance,
+                    free_spins,
+                    is_activated,
+                    created_at
                 FROM cheryspin_users
-                WHERE phone = $1
+                WHERE
+                    LOWER(email) = LOWER($1)
+                    OR phone = $1
+                LIMIT 1
                 `,
-                [cleanPhone]
+                [cleanIdentifier]
             );
 
 
@@ -306,7 +583,7 @@ app.post("/api/login", async (req, res) => {
                 success: false,
 
                 message:
-                    "Invalid phone number or password."
+                    "Invalid email/phone number or password."
 
             });
 
@@ -317,9 +594,27 @@ app.post("/api/login", async (req, res) => {
             result.rows[0];
 
 
+        /* =========================
+           CHECK PASSWORD
+        ========================= */
+
+        if (!user.password_hash) {
+
+            return res.status(401).json({
+
+                success: false,
+
+                message:
+                    "This account does not have a password. Please create a new account."
+
+            });
+
+        }
+
+
         const passwordMatches =
             await bcrypt.compare(
-                password,
+                cleanPassword,
                 user.password_hash
             );
 
@@ -331,12 +626,16 @@ app.post("/api/login", async (req, res) => {
                 success: false,
 
                 message:
-                    "Invalid phone number or password."
+                    "Invalid email/phone number or password."
 
             });
 
         }
 
+
+        /* =========================
+           LOGIN SUCCESS
+        ========================= */
 
         res.json({
 
@@ -347,10 +646,17 @@ app.post("/api/login", async (req, res) => {
 
             user: {
 
-                id: user.id,
+                id:
+                    user.id,
 
                 full_name:
                     user.full_name,
+
+                age:
+                    user.age,
+
+                email:
+                    user.email,
 
                 phone:
                     user.phone,
@@ -362,7 +668,10 @@ app.post("/api/login", async (req, res) => {
                     user.free_spins,
 
                 is_activated:
-                    user.is_activated
+                    user.is_activated,
+
+                created_at:
+                    user.created_at
 
             }
 
@@ -421,6 +730,8 @@ app.get("/api/users/:id", async (req, res) => {
                 SELECT
                     id,
                     full_name,
+                    age,
+                    email,
                     phone,
                     balance,
                     free_spins,
